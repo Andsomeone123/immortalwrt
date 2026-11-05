@@ -1,0 +1,189 @@
+
+name: Build SR1010 Kmods
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential gcc-multilib g++-multilib \
+            git curl wget rsync unzip zip zstd xz-utils \
+            python3 python3-pyelftools python3-setuptools \
+            python3-venv python3-dev \
+            autoconf automake autopoint bison flex \
+            gawk gettext libtool pkgconf \
+            libncurses-dev libssl-dev libelf-dev \
+            libgmp-dev libmpc-dev libmpfr-dev \
+            libyaml-dev libglib2.0-dev \
+            libreadline-dev zlib1g-dev \
+            clang llvm lld cmake ninja-build \
+            cpio patch file subversion swig texinfo \
+            device-tree-compiler squashfs-tools \
+            help2man xxd
+
+      - name: Checkout SR1010 sources
+        run: |
+          mkdir -p src
+
+          git clone --depth 1 \
+            --branch sr1010-zx279133 \
+            https://github.com/cnjn/immortalwrt.git \
+            src/immortalwrt
+
+          git clone --depth 1 \
+            --branch build \
+            --recurse-submodules \
+            https://github.com/cnjn/linux-mainline-zte-zxslc-sr1010.git \
+            src/linux-mainline-zte-zxslc-sr1010
+
+          test -f \
+            src/linux-mainline-zte-zxslc-sr1010/linux-6.18.38/Makefile
+
+      - name: Add Nikki feed
+        working-directory: src/immortalwrt
+        run: |
+          echo \
+            'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' \
+            >> feeds.conf.default
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure packages
+        working-directory: src/immortalwrt
+        run: |
+          cp \
+            configs/zte_zx279133_sr1010_squashfs.config \
+            .config
+
+          KERNEL_TREE="$(realpath \
+            ../linux-mainline-zte-zxslc-sr1010/linux-6.18.38)"
+
+          printf 'CONFIG_EXTERNAL_KERNEL_TREE="%s"\n' \
+            "$KERNEL_TREE" >> .config
+
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_kmod-inet-diag=m
+          CONFIG_PACKAGE_kmod-tun=m
+          CONFIG_PACKAGE_kmod-dummy=m
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_mihomo-meta=m
+          CONFIG_PACKAGE_nikki=m
+          CONFIG_PACKAGE_luci-app-nikki=m
+          CONFIG_LUCI_LANG_zh_Hans=y
+          EOF
+
+          make defconfig
+
+          echo "===== Selected packages ====="
+          grep -E \
+            '^CONFIG_PACKAGE_(kmod-inet-diag|kmod-tun|kmod-dummy|kmod-nft-tproxy|kmod-nft-socket|mihomo-meta|nikki|luci-app-nikki)=' \
+            .config
+
+          for pkg in \
+            kmod-inet-diag \
+            kmod-tun \
+            kmod-dummy \
+            mihomo-meta \
+            nikki \
+            luci-app-nikki
+          do
+            grep -Eq \
+              "^CONFIG_PACKAGE_${pkg}=[ym]$" .config || {
+                echo "Package not selected: $pkg"
+                exit 1
+              }
+          done
+
+      - name: Download sources
+        working-directory: src/immortalwrt
+        run: make -j2 download
+
+      - name: Build host tools
+        working-directory: src/immortalwrt
+        run: make -j2 tools/install
+
+      - name: Build toolchain
+        working-directory: src/immortalwrt
+        run: make -j2 toolchain/install
+
+      - name: Build kernel and modules
+        working-directory: src/immortalwrt
+        run: |
+          make -j2 target/linux/compile
+          make -j2 package/kernel/linux/compile
+
+      - name: Build Mihomo
+        working-directory: src/immortalwrt
+        run: |
+          make -j2 package/feeds/nikki/mihomo-meta/compile
+
+      - name: Build Nikki
+        working-directory: src/immortalwrt
+        run: |
+          make -j2 package/feeds/nikki/nikki/compile
+          make -j2 package/feeds/nikki/luci-app-nikki/compile
+
+      - name: Collect APK packages
+        run: |
+          mkdir -p output
+
+          cd src/immortalwrt
+
+          find bin -type f -name '*.apk' \
+            \( -name 'kmod-*.apk' \
+            -o -name 'nikki-*.apk' \
+            -o -name 'luci-app-nikki-*.apk' \
+            -o -name 'luci-i18n-nikki-zh-cn-*.apk' \
+            -o -name 'mihomo-meta-*.apk' \) \
+            -exec cp {} "$GITHUB_WORKSPACE/output/" \;
+
+          {
+            echo "ImmortalWrt:"
+            git rev-parse HEAD
+            echo "Kernel source:"
+            git -C ../linux-mainline-zte-zxslc-sr1010 \
+              rev-parse HEAD
+            echo "Nikki:"
+            git -C feeds/nikki rev-parse HEAD
+            echo "Selected packages:"
+            grep -E \
+              '^CONFIG_PACKAGE_(kmod-inet-diag|kmod-tun|kmod-dummy|mihomo-meta|nikki|luci-app-nikki)=' \
+              .config
+          } > "$GITHUB_WORKSPACE/output/build-info.txt"
+
+          ls -lh "$GITHUB_WORKSPACE/output"
+
+          test -n "$(find "$GITHUB_WORKSPACE/output" \
+            -name 'kmod-inet-diag-*.apk' -print -quit)"
+
+          test -n "$(find "$GITHUB_WORKSPACE/output" \
+            -name 'nikki-*.apk' -print -quit)"
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SR1010-Nikki-Kmods
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
