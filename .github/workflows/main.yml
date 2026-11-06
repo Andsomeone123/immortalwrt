@@ -40,6 +40,7 @@ jobs:
       ZTE_MESH_REV: 0df93c7f4255462b47aee233e7c9683f650a6fe9
       NIKKI_REV: 78e1a751d55ed0762811f054ee699049473da7b8
       SSR_REV: 81c6320d40d455e6d623b6579f460d0665e1a421
+      ADGUARD_LUCI_REV: e72313f8bed4d6f551b041ed329edb8ba0147d48
       PROXY: ${{ inputs.proxy }}
       FILEBROWSER: ${{ inputs.filebrowser }}
       ADGUARD_TF_MOUNT: ${{ inputs.adguard_tf_mount }}
@@ -98,7 +99,32 @@ jobs:
             *) echo "::error::Unknown proxy option"; exit 1 ;;
           esac
           ./scripts/feeds update -a
+          # A package in the source tree takes precedence over the same
+          # package name in the LuCI feed. Add it before installing feeds.
+          git init package/luci-app-adguardhome
+          git -C package/luci-app-adguardhome remote add origin https://github.com/kenzok78/luci-app-adguardhome.git
+          git -C package/luci-app-adguardhome fetch --depth=1 origin "$ADGUARD_LUCI_REV"
+          git -C package/luci-app-adguardhome checkout --detach FETCH_HEAD
+          test "$(git -C package/luci-app-adguardhome rev-parse HEAD)" = "$ADGUARD_LUCI_REV"
           ./scripts/feeds install -a
+          if [[ -L package/feeds/luci/luci-app-adguardhome ]]; then
+            unlink package/feeds/luci/luci-app-adguardhome
+          fi
+          # The pinned LuCI tree keeps its Lua compatibility package under modules/.
+          sed -i 's|feeds/luci/luci-compat/Makefile|feeds/luci/modules/luci-compat/Makefile|' \
+            package/luci-app-adguardhome/Makefile
+          # The kenzok78 panel owns the service. Build the official core and keep
+          # its legacy conffile for migration, but omit its second service.
+          sed -i -e '/INSTALL_BIN).*\/adguardhome\.init /d' \
+            -e '/INSTALL_BIN).*\/adguardhome\.defaults /d' \
+            feeds/packages/net/adguardhome/Makefile
+          if grep -Eq 'INSTALL_BIN.*adguardhome\.(init|defaults)' feeds/packages/net/adguardhome/Makefile; then
+            echo "::error::The lowercase AdGuard Home service would still be installed"
+            exit 1
+          fi
+          # Package postinst also runs while assembling the image.
+          sed -i '/^define Package\/luci-app-adguardhome\/postinst$/,+1 { /^#!\/bin\/sh$/a\[ -n "$${IPKG_INSTROOT}" ] \&\& exit 0
+          }' package/luci-app-adguardhome/Makefile
           if [[ "$PROXY" == nikki ]]; then
             # The stable and alpha providers declare mutual conflicts, which
             # this buildroot translates into a Kconfig dependency cycle.
@@ -108,6 +134,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/sr1010-artifact"
           {
             printf 'immortalwrt %s\n' "$(git rev-parse HEAD)"
+            printf 'kenzok78/luci-app-adguardhome %s\n' "$ADGUARD_LUCI_REV"
             for feed in feeds/*; do
               if [[ -d "$feed/.git" ]]; then
                 printf '%s %s\n' "${feed##*/}" "$(git -C "$feed" rev-parse HEAD)"
@@ -159,10 +186,11 @@ jobs:
           set_config CONFIG_PACKAGE_dnsmasq-dhcpv6 n
           set_config CONFIG_PACKAGE_dnsmasq_full_nftset y
           set_config CONFIG_PACKAGE_automount n
+          set_config CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary y
           required=(
             zte-fwslot luci-app-zte-fwslot
             firewall4 dnsmasq-full ppp ppp-mod-pppoe luci-proto-ppp
-            adguardhome luci-app-adguardhome
+            adguardhome luci-app-adguardhome luci-compat
             block-mount e2fsprogs kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas
             kmod-zte-npu kmod-zte-fnoffload kmod-zte-rtl8372n
             kmod-nft-offload kmod-nft-tproxy kmod-nft-socket kmod-inet-diag kmod-tun
@@ -217,6 +245,8 @@ jobs:
           grep -Fx 'CONFIG_TARGET_DEFAULT_LAN_IP_FROM_PREINIT=y' .config
           grep -Fx 'CONFIG_TARGET_PREINIT_IP="192.168.1.2"' .config
           grep -Fx 'CONFIG_USE_APK=y' .config
+          grep -Fx 'CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary=y' .config
+          grep -Fx 'Source-Makefile: package/luci-app-adguardhome/Makefile' tmp/.packageinfo
           if grep -Eq '^CONFIG_(EXTERNAL_KERNEL_TREE|KERNEL_GIT_CLONE_URI)="[^"]' .config; then
             echo "::error::This pinned target uses its in-tree kernel patch series"
             exit 1
@@ -249,6 +279,37 @@ jobs:
           # Also disable services on first boot after restoring a settings archive.
           # Leave profiles and nodes available for manual activation.
           install -d files/etc/uci-defaults
+          cat > files/etc/uci-defaults/39-sr1010-adguard-migrate <<'SH'
+          #!/bin/sh
+          # A restored configuration for kenzok78 takes precedence. Otherwise
+          # import the active settings from the stock AdGuard Home package.
+          target=AdGuardHome.AdGuardHome
+          if cmp -s /etc/config/AdGuardHome /rom/etc/config/AdGuardHome &&
+             [ "$(uci -q get adguardhome.config.enabled)" = 1 ]; then
+            config_path=$(uci -q get adguardhome.config.config)
+            [ -n "$config_path" ] || config_path=$(uci -q get adguardhome.config.config_file)
+            work_dir=$(uci -q get adguardhome.config.workdir)
+            [ -n "$work_dir" ] || work_dir=$(uci -q get adguardhome.config.work_dir)
+            if [ -n "$config_path" ]; then
+              uci set "$target.configpath=$config_path"
+            fi
+            if [ -n "$work_dir" ]; then
+              uci set "$target.workdir=$work_dir"
+            fi
+            uci set "$target.enabled=1"
+            uci set "$target.redirect=none"
+            # Let the existing YAML decide the web port for imported settings.
+            uci set "$target.httpport="
+          fi
+          uci set "$target.binpath=/usr/bin/AdGuardHome"
+          uci commit AdGuardHome
+          SH
+
+          # In this firmware an explicitly empty httpport leaves the YAML in charge.
+          sed -i \
+            -e 's/^\([[:space:]]*\)config_get httpport \$CONFIGURATION httpport 3000$/\1httpport="$(uci -q get AdGuardHome.AdGuardHome.httpport)" || httpport=3000/' \
+            -e 's/^\([[:space:]]*\)ADDITIONAL_ARGS="\$ADDITIONAL_ARGS -p \$httpport"$/\1[ -z "$httpport" ] || ADDITIONAL_ARGS="$ADDITIONAL_ARGS -p $httpport"/' \
+            package/luci-app-adguardhome/root/etc/init.d/AdGuardHome
           cat > files/etc/uci-defaults/zz-sr1010-proxy-defaults <<'SH'
           #!/bin/sh
           for service in nikki shadowsocksr xray flowproxy; do
@@ -276,9 +337,9 @@ jobs:
             python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("feeds/packages/net/adguardhome/files/adguardhome.init")
+          path = Path("package/luci-app-adguardhome/root/etc/init.d/AdGuardHome")
           text = path.read_text()
-          marker = '\tlocal config_dir\n'
+          marker = 'start_service() {\n'
           assert text.count(marker) == 1
           check = """\tlocal tf_mount
           \tif [ -r /etc/sr1010-adguard-tf-mount ]; then
@@ -290,7 +351,7 @@ jobs:
           \tfi
 
           """
-          path.write_text(text.replace(marker, check + marker))
+          path.write_text(text.replace(marker, marker + check))
           PY
           fi
 
