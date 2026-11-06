@@ -146,6 +146,14 @@ jobs:
         working-directory: immortalwrt
         run: |
           set -euo pipefail
+          # Linux 7.3 has removed atmsvc.h. Registering the PPPoA subpackage
+          # pulls in linux-atm as a build dependency even with PPPoA unselected.
+          ppp_makefile=package/network/services/ppp/Makefile
+          grep -Fq -- '--with-atm' "$ppp_makefile"
+          grep -Fxq '$(eval $(call BuildPackage,ppp-mod-pppoa))' "$ppp_makefile"
+          sed -i -e 's/--with-atm/--without-atm/' \
+            -e '/^\$(eval \$(call BuildPackage,ppp-mod-pppoa))$/d' "$ppp_makefile"
+
           # Keep a single dnsmasq variant and use UUID-based fstab mounts.
           sed -i -e 's/\bdnsmasq ethtool\b/dnsmasq-full ethtool-full/' \
             -e 's/\blosetup automount autocore\b/losetup autocore/' target/linux/zte/image/Makefile
@@ -247,6 +255,11 @@ jobs:
           grep -Fx 'CONFIG_USE_APK=y' .config
           grep -Fx 'CONFIG_PACKAGE_luci-app-adguardhome_INCLUDE_binary=y' .config
           grep -Fx 'Source-Makefile: package/luci-app-adguardhome/Makefile' tmp/.packageinfo
+          if grep -Eq '^\$\(curdir\)/network/services/ppp/compile .*network/utils/linux-atm/compile' tmp/.packagedeps ||
+             grep -Eq '^CONFIG_PACKAGE_(linux-atm|ppp-mod-pppoa|br2684ctl|atm-[^=]+)=[ym]$' .config; then
+            echo "::error::Legacy ATM userspace packages cannot be built with this kernel"
+            exit 1
+          fi
           if grep -Eq '^CONFIG_(EXTERNAL_KERNEL_TREE|KERNEL_GIT_CLONE_URI)="[^"]' .config; then
             echo "::error::This pinned target uses its in-tree kernel patch series"
             exit 1
@@ -360,10 +373,25 @@ jobs:
         run: |
           set -euo pipefail
           make -j"$(nproc)" download
-          make -j"$(nproc)" V=s > "$RUNNER_TEMP/sr1010-build.log" 2>&1 || {
-            tail -n 180 "$RUNNER_TEMP/sr1010-build.log"
-            exit 1
-          }
+          log="$RUNNER_TEMP/sr1010-build.log"
+          if make --output-sync=target -j"$(nproc)" V=s > "$log" 2>&1; then
+            exit 0
+          else
+            build_status=$?
+          fi
+
+          echo "::group::OpenWrt failed targets"
+          grep -nE 'ERROR: .*failed to build|^make(\[[0-9]+\])?: \*\*\*' "$log" | tail -n 30 || true
+          echo "::endgroup::"
+          echo "::group::Compiler and build errors"
+          grep -nEi -m 20 -B 5 -A 8 \
+            '(^|[[:space:]])(fatal )?error:|\.go:[0-9]+:[0-9]+:|undefined reference|No space left on device|out of memory|signal: killed|\bkilled\b' "$log" || true
+          echo "::endgroup::"
+          echo "::group::End of build log"
+          tail -n 180 "$log"
+          echo "::endgroup::"
+          echo "::error::Firmware build failed. Download sr1010-build-log for the full output."
+          exit "$build_status"
 
       - name: Validate and collect the sysupgrade image
         working-directory: immortalwrt
