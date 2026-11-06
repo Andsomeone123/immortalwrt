@@ -1,8 +1,28 @@
-
-name: Build SR1010 Kmods
+name: Build SR1010 sysupgrade
 
 on:
   workflow_dispatch:
+    inputs:
+      proxy:
+        description: "固件内置代理（首次开机禁用自启）"
+        type: choice
+        default: nikki
+        options:
+          - nikki
+          - ssr-xray
+          - none
+      filebrowser:
+        description: "内置 File Browser 和对应 LuCI 管理页"
+        type: boolean
+        default: true
+      adguard_tf_mount:
+        description: "可选，AdGuard Home 使用的 TF 实际挂载点，例如 /mnt/tf（留空则沿用软件包行为）"
+        type: string
+        default: ""
+      extra_packages:
+        description: "额外内置包名（用空格分隔，需存在于已启用的 feeds）"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -11,179 +31,334 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      # cnjn/immortalwrt master, Linux 7.3.1 with in-tree ZTE patches.
+      IMMORTALWRT_REV: ac68c3f8ecb2924c3b763a955e8c9820713c1e7e
+      ZTE_MESH_REV: 0df93c7f4255462b47aee233e7c9683f650a6fe9
+      NIKKI_REV: 78e1a751d55ed0762811f054ee699049473da7b8
+      SSR_REV: 81c6320d40d455e6d623b6579f460d0665e1a421
+      PROXY: ${{ inputs.proxy }}
+      FILEBROWSER: ${{ inputs.filebrowser }}
+      ADGUARD_TF_MOUNT: ${{ inputs.adguard_tf_mount }}
+      EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
 
     steps:
-      - name: Free disk space
+      - name: Install Linux build dependencies
         run: |
-          sudo rm -rf /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Install build dependencies
-        run: |
+          set -euo pipefail
+          # Hosted runner only. Free space for the cross-toolchain and Go/Node builds.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h "$GITHUB_WORKSPACE"
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential gcc-multilib g++-multilib \
-            git curl wget rsync unzip zip zstd xz-utils \
-            python3 python3-pyelftools python3-setuptools \
-            python3-venv python3-dev \
-            autoconf automake autopoint bison flex \
-            gawk gettext libtool pkgconf \
-            libncurses-dev libssl-dev libelf-dev \
-            libgmp-dev libmpc-dev libmpfr-dev \
-            libyaml-dev libglib2.0-dev \
-            libreadline-dev zlib1g-dev \
-            clang llvm lld cmake ninja-build \
-            cpio patch file subversion swig texinfo \
-            device-tree-compiler squashfs-tools \
-            help2man xxd
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang llvm lld libclang-dev dwarves libelf-dev libssl-dev \
+            bison flex gawk gettext git file ccache rsync zstd xz-utils unzip zip \
+            libncurses-dev zlib1g-dev python3 python3-setuptools python3-pyelftools \
+            swig libpython3-dev perl patch pkg-config wget curl openssl time \
+            xsltproc libxml-parser-perl jq
 
-      - name: Checkout SR1010 sources
+      - name: Fetch and check the pinned SR1010 source
         run: |
-          mkdir -p src
+          set -euo pipefail
+          git init immortalwrt
+          git -C immortalwrt remote add origin https://github.com/cnjn/immortalwrt.git
+          git -C immortalwrt fetch --depth=1 origin "$IMMORTALWRT_REV"
+          git -C immortalwrt checkout --detach FETCH_HEAD
+          cd immortalwrt
+          test "$(git rev-parse HEAD)" = "$IMMORTALWRT_REV"
+          grep -Fx 'LINUX_VERSION-7.3 = .1' target/linux/generic/kernel-7.3
+          grep -Eq 'IMAGE/sysupgrade\.bin := sr1010-firmware' target/linux/zte/image/Makefile
+          test -x scripts/configure-sr1010-flash.sh
+          test -s target/linux/zte/mkfw/sr1010-mkfw.py
+          for blob in sr1010-header.bin sr1010-uboot.bin zx279133-npu.bin; do
+            test -s "package/firmware/zte/flies/$blob"
+          done
+          # A local version string identifies this customized build in LuCI.
+          printf 'custom-%s\n' "${IMMORTALWRT_REV:0:12}" > version
 
-          git clone --depth 1 \
-            --branch sr1010-zx279133 \
-            https://github.com/cnjn/immortalwrt.git \
-            src/immortalwrt
-
-          git clone --depth 1 \
-            --branch build \
-            --recurse-submodules \
-            https://github.com/cnjn/linux-mainline-zte-zxslc-sr1010.git \
-            src/linux-mainline-zte-zxslc-sr1010
-
-          test -f \
-            src/linux-mainline-zte-zxslc-sr1010/linux-6.18.38/Makefile
-
-      - name: Add Nikki feed
-        working-directory: src/immortalwrt
+      - name: Prepare package feeds
+        working-directory: immortalwrt
         run: |
-          echo \
-            'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' \
-            >> feeds.conf.default
-
+          set -euo pipefail
+          cp feeds.conf.default feeds.conf
+          sed -i "s|^src-git zte_mesh .*|src-git zte_mesh https://github.com/cnjn/zte-mesh.git^${ZTE_MESH_REV}|" feeds.conf
+          case "$PROXY" in
+            nikki)
+              printf 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git^%s\n' "$NIKKI_REV" >> feeds.conf
+              ;;
+            ssr-xray)
+              printf 'src-git helloworld https://github.com/fw876/helloworld.git^%s\n' "$SSR_REV" >> feeds.conf
+              ;;
+            none) ;;
+            *) echo "::error::Unknown proxy option"; exit 1 ;;
+          esac
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          if [[ "$PROXY" == nikki ]]; then
+            # The stable and alpha providers declare mutual conflicts, which
+            # this buildroot translates into a Kconfig dependency cycle.
+            test -L package/feeds/nikki/mihomo-alpha
+            unlink package/feeds/nikki/mihomo-alpha
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/sr1010-artifact"
+          {
+            printf 'immortalwrt %s\n' "$(git rev-parse HEAD)"
+            for feed in feeds/*; do
+              if [[ -d "$feed/.git" ]]; then
+                printf '%s %s\n' "${feed##*/}" "$(git -C "$feed" rev-parse HEAD)"
+              fi
+            done
+          } > "$GITHUB_WORKSPACE/sr1010-artifact/source-revisions.txt"
 
-      - name: Configure packages
-        working-directory: src/immortalwrt
+      - name: Select firmware packages and defaults
+        working-directory: immortalwrt
         run: |
-          cp \
-            configs/zte_zx279133_sr1010_squashfs.config \
-            .config
+          set -euo pipefail
+          # Keep a single dnsmasq variant and use UUID-based fstab mounts.
+          sed -i -e 's/\bdnsmasq ethtool\b/dnsmasq-full ethtool-full/' \
+            -e 's/\blosetup automount autocore\b/losetup autocore/' target/linux/zte/image/Makefile
+          grep -F 'dnsmasq-full ethtool-full ip-full' target/linux/zte/image/Makefile
+          ./scripts/configure-sr1010-flash.sh
 
-          KERNEL_TREE="$(realpath \
-            ../linux-mainline-zte-zxslc-sr1010/linux-6.18.38)"
+          set_config() {
+            local symbol="$1" value="$2" pattern
+            pattern="${symbol//./\\.}"
+            sed -i -e "/^${pattern}=/d" -e "/^# ${pattern} is not set$/d" .config
+            if [[ "$value" == n ]]; then
+              printf '# %s is not set\n' "$symbol" >> .config
+            else
+              printf '%s=%s\n' "$symbol" "$value" >> .config
+            fi
+          }
 
-          printf 'CONFIG_EXTERNAL_KERNEL_TREE="%s"\n' \
-            "$KERNEL_TREE" >> .config
-
-          cat >> .config <<'EOF'
-          CONFIG_PACKAGE_kmod-inet-diag=m
-          CONFIG_PACKAGE_kmod-tun=m
-          CONFIG_PACKAGE_kmod-dummy=m
-          CONFIG_PACKAGE_kmod-nft-tproxy=y
-          CONFIG_PACKAGE_kmod-nft-socket=y
-          CONFIG_PACKAGE_mihomo-meta=m
-          CONFIG_PACKAGE_nikki=m
-          CONFIG_PACKAGE_luci-app-nikki=m
-          CONFIG_LUCI_LANG_zh_Hans=y
-          EOF
-
-          make defconfig
-
-          echo "===== Selected packages ====="
-          grep -E \
-            '^CONFIG_PACKAGE_(kmod-inet-diag|kmod-tun|kmod-dummy|kmod-nft-tproxy|kmod-nft-socket|mihomo-meta|nikki|luci-app-nikki)=' \
-            .config
-
+          # Trim upstream extras to leave room in the 41 MiB flash slot.
+          # Add any in use on your router through extra_packages.
           for pkg in \
-            kmod-inet-diag \
-            kmod-tun \
-            kmod-dummy \
-            mihomo-meta \
-            nikki \
-            luci-app-nikki
-          do
-            grep -Eq \
-              "^CONFIG_PACKAGE_${pkg}=[ym]$" .config || {
-                echo "Package not selected: $pkg"
-                exit 1
-              }
+            luci-theme-aerowrt luci-theme-argon luci-app-argon-config \
+            luci-app-zerotier zerotier luci-app-ttyd luci-app-ddns \
+            ddns-scripts-services ddns-scripts-aliyun ddns-scripts-dnspod ddns-scripts-cloudflare \
+            luci-app-upnp miniupnpd-nftables luci-app-nlbwmon luci-app-autoreboot luci-app-wol \
+            luci-app-ksmbd wsdd2 luci-app-zte-mesh zte-mesh \
+            luci-app-lxc lxc lxc-start lxc-stop lxc-ls lxc-info lxc-destroy lxc-checkconfig lxc-auto \
+            luci-app-mwan3 luci-app-syncdial luci-app-omcproxy omcproxy mcfast \
+            luci-app-rtp2httpd rtp2httpd luci-app-flowproxy luci-app-fwupdate fwupdate \
+            wget-ssl bind-dig mtr-nojson iftop nload openssh-client rsync \
+            htop lsof less tmux nano bash file smartmontools xz-utils; do
+            set_config "CONFIG_PACKAGE_$pkg" n
           done
 
-      - name: Download sources
-        working-directory: src/immortalwrt
-        run: make -j2 download
+          set_config CONFIG_TARGET_PER_DEVICE_ROOTFS n
+          set_config CONFIG_TARGET_PREINIT_IP '"192.168.1.2"'
+          set_config CONFIG_TARGET_PREINIT_BROADCAST '"192.168.1.255"'
+          set_config CONFIG_PACKAGE_dnsmasq n
+          set_config CONFIG_PACKAGE_dnsmasq-dhcpv6 n
+          set_config CONFIG_PACKAGE_dnsmasq_full_nftset y
+          set_config CONFIG_PACKAGE_automount n
+          required=(
+            zte-fwslot luci-app-zte-fwslot
+            firewall4 dnsmasq-full ppp ppp-mod-pppoe luci-proto-ppp
+            adguardhome luci-app-adguardhome
+            block-mount e2fsprogs kmod-fs-ext4 kmod-usb-storage kmod-usb-storage-uas
+            kmod-zte-npu kmod-zte-fnoffload kmod-zte-rtl8372n
+            kmod-nft-offload kmod-nft-tproxy kmod-nft-socket kmod-inet-diag kmod-tun
+          )
+          if [[ "$FILEBROWSER" == true ]]; then
+            required+=(filebrowser luci-app-filebrowser-go)
+          fi
 
-      - name: Build host tools
-        working-directory: src/immortalwrt
-        run: make -j2 tools/install
+          set_config CONFIG_PACKAGE_dae n
+          set_config CONFIG_PACKAGE_luci-app-dae n
+          case "$PROXY" in
+            nikki)
+              required+=(nikki luci-app-nikki mihomo-meta kmod-dummy)
+              ;;
+            ssr-xray)
+              required+=(luci-app-ssr-plus xray-core)
+              ssr=CONFIG_PACKAGE_luci-app-ssr-plus
+              set_config "${ssr}_Nftables_Transparent_Proxy" y
+              set_config "${ssr}_INCLUDE_Xray" y
+              set_config "${ssr}_INCLUDE_Shadowsocks_NONE_Client" y
+              set_config "${ssr}_INCLUDE_Shadowsocks_NONE_Server" y
+              set_config "${ssr}_INCLUDE_MosDNS" n
+              set_config "${ssr}_INCLUDE_DNS2SOCKS" n
+              set_config "${ssr}_INCLUDE_Shadowsocks_Simple_Obfs" n
+              ;;
+          esac
 
-      - name: Build toolchain
-        working-directory: src/immortalwrt
-        run: make -j2 toolchain/install
+          read -r -a extras <<< "${EXTRA_PACKAGES//$'\n'/ }"
+          for pkg in "${extras[@]}"; do
+            if [[ ! "$pkg" =~ ^[[:alnum:]][[:alnum:]_.+-]*$ ]]; then
+              printf 'Invalid package name: %s\n' "$pkg" >&2
+              exit 1
+            fi
+            case "$pkg" in
+              dae|dae-*|luci-app-dae|daed|daed-*|luci-app-daed)
+                printf 'dae packages are excluded from this firmware: %s\n' "$pkg" >&2
+                exit 1
+                ;;
+              dnsmasq|dnsmasq-dhcpv6|nikki|luci-app-nikki|mihomo|mihomo-*|luci-app-ssr-plus|xray-core)
+                printf 'Use the proxy selector or the built-in dnsmasq-full: %s\n' "$pkg" >&2
+                exit 1
+                ;;
+            esac
+            required+=("$pkg")
+          done
+          for pkg in "${required[@]}"; do
+            set_config "CONFIG_PACKAGE_$pkg" y
+          done
+          make defconfig
+          grep -Fx 'CONFIG_TARGET_DEVICE_zte_zx279133_DEVICE_zte_zxslc-sr1010=y' .config
+          grep -Fx 'CONFIG_TARGET_ROOTFS_SQUASHFS=y' .config
+          grep -Fx 'CONFIG_TARGET_DEFAULT_LAN_IP_FROM_PREINIT=y' .config
+          grep -Fx 'CONFIG_TARGET_PREINIT_IP="192.168.1.2"' .config
+          grep -Fx 'CONFIG_USE_APK=y' .config
+          if grep -Eq '^CONFIG_(EXTERNAL_KERNEL_TREE|KERNEL_GIT_CLONE_URI)="[^"]' .config; then
+            echo "::error::This pinned target uses its in-tree kernel patch series"
+            exit 1
+          fi
+          for pkg in "${required[@]}"; do
+            if ! grep -Fxq "CONFIG_PACKAGE_$pkg=y" .config; then
+              printf 'Package missing after defconfig: %s\n' "$pkg" >&2
+              exit 1
+            fi
+          done
+          if grep -Eq '^CONFIG_PACKAGE_dnsmasq(-dhcpv6)?=y$' .config; then
+            echo "::error::A second dnsmasq variant was selected"
+            exit 1
+          fi
+          printf '%s\n' "${required[@]}" | sort -u > "$RUNNER_TEMP/required-packages"
 
-      - name: Build kernel and modules
-        working-directory: src/immortalwrt
+          # Suppress autostart at image creation, even if package postinst enables it.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("include/rootfs.mk")
+          text = path.read_text()
+          marker = 'if ! echo " $(3) "'
+          assert text.count(marker) == 1
+          path.write_text(text.replace(
+              marker, 'if ! echo " $(3) nikki shadowsocksr xray flowproxy "',
+          ))
+          PY
+
+          # Also disable services on first boot after restoring a settings archive.
+          # Leave profiles and nodes available for manual activation.
+          install -d files/etc/uci-defaults
+          cat > files/etc/uci-defaults/zz-sr1010-proxy-defaults <<'SH'
+          #!/bin/sh
+          for service in nikki shadowsocksr xray flowproxy; do
+            if [ -x "/etc/init.d/$service" ]; then
+              "/etc/init.d/$service" disable
+            fi
+          done
+          # The Nikki firewall include also reads this switch directly.
+          if uci -q get nikki.config.enabled >/dev/null; then
+            uci set nikki.config.enabled=0
+            uci commit nikki
+          fi
+          exit 0
+          SH
+
+          # Opt-in mount check. The restored UCI settings still supply the YAML
+          # path and work directory. This only gates startup on the mount.
+          if [[ -n "$ADGUARD_TF_MOUNT" ]]; then
+            if [[ ! "$ADGUARD_TF_MOUNT" =~ ^(/[a-zA-Z0-9_.-]+)+$ ]] ||
+               [[ "$ADGUARD_TF_MOUNT/" == */../* || "$ADGUARD_TF_MOUNT/" == */./* ]]; then
+              echo "::error::Enter the absolute TF mount point without spaces or a trailing slash"
+              exit 1
+            fi
+            printf '%s\n' "$ADGUARD_TF_MOUNT" > files/etc/sr1010-adguard-tf-mount
+            python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("feeds/packages/net/adguardhome/files/adguardhome.init")
+          text = path.read_text()
+          marker = '\tlocal config_dir\n'
+          assert text.count(marker) == 1
+          check = """\tlocal tf_mount
+          \tif [ -r /etc/sr1010-adguard-tf-mount ]; then
+          \t\tread -r tf_mount < /etc/sr1010-adguard-tf-mount
+          \t\tif ! awk -v path="$tf_mount" '$2 == path { found = 1 } END { exit !found }' /proc/mounts; then
+          \t\t\tlogger -t adguardhome "Waiting for TF mount: $tf_mount"
+          \t\t\treturn 1
+          \t\tfi
+          \tfi
+
+          """
+          path.write_text(text.replace(marker, check + marker))
+          PY
+          fi
+
+      - name: Download and build the flashable image
+        working-directory: immortalwrt
         run: |
-          make -j2 target/linux/compile
-          make -j2 package/kernel/linux/compile
+          set -euo pipefail
+          make -j"$(nproc)" download
+          make -j"$(nproc)" V=s > "$RUNNER_TEMP/sr1010-build.log" 2>&1 || {
+            tail -n 180 "$RUNNER_TEMP/sr1010-build.log"
+            exit 1
+          }
 
-      - name: Build Mihomo
-        working-directory: src/immortalwrt
+      - name: Validate and collect the sysupgrade image
+        working-directory: immortalwrt
         run: |
-          make -j2 package/feeds/nikki/mihomo-meta/compile
+          set -euo pipefail
+          target=bin/targets/zte/zx279133
+          stem=immortalwrt-zte-zx279133-zte_zxslc-sr1010-squashfs-sysupgrade
+          image="$target/$stem.bin"
+          test -s "$image"
+          # 'check' parses the SR1010 container and CRCs without accessing MTD.
+          cc -O2 -o "$RUNNER_TEMP/zte-fwslot-host" package/utils/zte-fwslot/src/zte-fwslot.c
+          "$RUNNER_TEMP/zte-fwslot-host" check "$image"
+          shopt -s nullglob
+          manifests=("$target/"*.manifest)
+          if (( ${#manifests[@]} != 1 )); then
+            echo "::error::Expected a single SR1010 package manifest"
+            exit 1
+          fi
+          awk '{print $1}' "${manifests[0]}" > "$RUNNER_TEMP/image-packages"
+          while IFS= read -r pkg; do
+            if ! grep -Fxq "$pkg" "$RUNNER_TEMP/image-packages"; then
+              printf 'Package missing from image: %s\n' "$pkg" >&2
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/required-packages"
+          if grep -Exq 'dnsmasq|dnsmasq-dhcpv6' "$RUNNER_TEMP/image-packages"; then
+            echo "::error::Unexpected dnsmasq variant in manifest"
+            exit 1
+          fi
+          if grep -Exq '(luci-app-)?dae(d)?(-.*)?' "$RUNNER_TEMP/image-packages"; then
+            echo "::error::Unexpected dae package in manifest"
+            exit 1
+          fi
+          dest="$GITHUB_WORKSPACE/sr1010-artifact"
+          cp "$image" "${manifests[0]}" "$dest/"
+          cp .config "$dest/config.buildinfo"
+          (
+            cd "$dest"
+            sha256sum "$stem.bin" > SHA256SUMS
+            du -h "$stem.bin"
+          )
 
-      - name: Build Nikki
-        working-directory: src/immortalwrt
-        run: |
-          make -j2 package/feeds/nikki/nikki/compile
-          make -j2 package/feeds/nikki/luci-app-nikki/compile
-
-      - name: Collect APK packages
-        run: |
-          mkdir -p output
-
-          cd src/immortalwrt
-
-          find bin -type f -name '*.apk' \
-            \( -name 'kmod-*.apk' \
-            -o -name 'nikki-*.apk' \
-            -o -name 'luci-app-nikki-*.apk' \
-            -o -name 'luci-i18n-nikki-zh-cn-*.apk' \
-            -o -name 'mihomo-meta-*.apk' \) \
-            -exec cp {} "$GITHUB_WORKSPACE/output/" \;
-
-          {
-            echo "ImmortalWrt:"
-            git rev-parse HEAD
-            echo "Kernel source:"
-            git -C ../linux-mainline-zte-zxslc-sr1010 \
-              rev-parse HEAD
-            echo "Nikki:"
-            git -C feeds/nikki rev-parse HEAD
-            echo "Selected packages:"
-            grep -E \
-              '^CONFIG_PACKAGE_(kmod-inet-diag|kmod-tun|kmod-dummy|mihomo-meta|nikki|luci-app-nikki)=' \
-              .config
-          } > "$GITHUB_WORKSPACE/output/build-info.txt"
-
-          ls -lh "$GITHUB_WORKSPACE/output"
-
-          test -n "$(find "$GITHUB_WORKSPACE/output" \
-            -name 'kmod-inet-diag-*.apk' -print -quit)"
-
-          test -n "$(find "$GITHUB_WORKSPACE/output" \
-            -name 'nikki-*.apk' -print -quit)"
-
-      - name: Upload APK artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload verified sysupgrade
+        uses: actions/upload-artifact@v7.0.2
         with:
-          name: SR1010-Nikki-Kmods
-          path: output/
+          name: sr1010-sysupgrade-${{ inputs.proxy }}
+          path: sr1010-artifact/
           if-no-files-found: error
-          retention-days: 30
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: sr1010-build-log
+          path: ${{ runner.temp }}/sr1010-build.log
+          if-no-files-found: ignore
+          retention-days: 7
